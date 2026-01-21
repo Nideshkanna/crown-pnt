@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 cognitive_mission_pnt.py
-CROWN-PNT Mission Control (Render-safe)
+CROWN PNT – Mission Control (Render-safe, HUD-restored)
 """
 
 import time
@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import math
 
 # =====================================================
-# OPTIONAL RTL-SDR SUPPORT (SAFE FOR CLOUD DEPLOYMENT)
+# OPTIONAL RTL-SDR SUPPORT (SAFE FOR CLOUD)
 # =====================================================
 try:
     from rtlsdr import RtlSdr
@@ -25,17 +25,18 @@ except Exception:
     RTL_AVAILABLE = False
 
 # ==========================================
-# 1. CONFIGURATION
+# CONFIGURATION
 # ==========================================
-
 TRUE_LAT = 12.9706089
 TRUE_LON = 80.0431389
-TRUE_ALT = 45.0  # meters
+TRUE_ALT = 45.0
 SPEED_OF_LIGHT = 299792.458  # km/s
 
 app = Flask(__name__)
 
-# BACKUP TLEs
+# ==========================================
+# EMBEDDED TLEs
+# ==========================================
 EMBEDDED_TLES = """
 NOAA 19
 1 33591U 09005A   24068.49474772  .00000216  00000-0  16386-3 0  9993
@@ -51,6 +52,9 @@ IRIDIUM 140
 2 43166  86.3955 135.2974 0002196  85.7332 274.4152 14.34216839339399
 """
 
+# ==========================================
+# GLOBAL STATE
+# ==========================================
 state = {
     "status": "BOOTING",
     "source": "INIT",
@@ -62,42 +66,41 @@ state = {
 
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
-    state['log'].append(f"[{ts}] {msg}")
-    state['log'] = state['log'][-10:]
+    state["log"].append(f"[{ts}] {msg}")
+    state["log"] = state["log"][-10:]
     print(f"[{ts}] {msg}")
 
 # ==========================================
-# 2. NAV ENGINE
+# NAV ENGINE
 # ==========================================
 class NavEngine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.ts = load.timescale()
-        self.sdr = None
-        self.sats_catalog = []
+        self.sats = []
         self.init_catalog()
         self.init_radio()
 
     def init_catalog(self):
-        log("CATALOG: Loading Embedded Core...")
+        log("CATALOG: Loading embedded TLEs")
         lines = EMBEDDED_TLES.strip().splitlines()
         for i in range(0, len(lines), 3):
             try:
-                s = EarthSatellite(lines[i+1], lines[i+2], lines[i], self.ts)
-                self.sats_catalog.append(s)
+                self.sats.append(EarthSatellite(
+                    lines[i+1], lines[i+2], lines[i], self.ts
+                ))
             except Exception:
                 pass
-        state['source'] = "EMBEDDED"
+        state["source"] = "EMBEDDED"
         threading.Thread(target=self.update_catalog_network, daemon=True).start()
 
     def update_catalog_network(self):
         time.sleep(2)
         urls = [
-            'https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle',
-            'https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium&FORMAT=tle',
-            'https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle'
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle",
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium&FORMAT=tle",
+            "https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle"
         ]
-        log("NET: Connecting to Deep Space Network...")
         sats = []
         for u in urls:
             try:
@@ -105,43 +108,24 @@ class NavEngine(threading.Thread):
             except Exception:
                 pass
         if len(sats) > 10:
-            self.sats_catalog = sats
-            state['source'] = "LIVE NETWORK"
-            log(f"CATALOG: {len(sats)} live targets loaded")
+            self.sats = sats
+            state["source"] = "LIVE NETWORK"
+            log(f"CATALOG: {len(sats)} live satellites")
 
     def init_radio(self):
         if not RTL_AVAILABLE:
-            log("RF: RTL-SDR not available (Simulation Mode).")
+            log("RF: RTL-SDR unavailable (simulation)")
             return
-        try:
-            self.sdr = RtlSdr()
-            self.sdr.sample_rate = 2.048e6
-            self.sdr.center_freq = 137.1e6
-            self.sdr.gain = 'auto'
-            log("RF: RTL-SDR Connected.")
-        except Exception:
-            self.sdr = None
-
-    def lla_to_ecef(self, lat, lon, alt):
-        lat, lon = math.radians(lat), math.radians(lon)
-        a, e2 = 6378.137, 0.00669437999
-        N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
-        return np.array([
-            (N + alt/1000)*math.cos(lat)*math.cos(lon),
-            (N + alt/1000)*math.cos(lat)*math.sin(lon),
-            (N*(1-e2) + alt/1000)*math.sin(lat)
-        ])
 
     def run(self):
-        truth = self.lla_to_ecef(TRUE_LAT, TRUE_LON, TRUE_ALT)
+        obs = wgs84.latlon(TRUE_LAT, TRUE_LON)
         log(f"INIT: Target Lock {TRUE_LAT:.6f}, {TRUE_LON:.6f}")
 
         while True:
-            obs = wgs84.latlon(TRUE_LAT, TRUE_LON)
             t = self.ts.now()
-            vis = []
+            visible = []
 
-            for sat in self.sats_catalog:
+            for sat in self.sats:
                 try:
                     geo = sat.at(t)
                     alt, az, _ = (sat - obs).at(t).altaz()
@@ -150,63 +134,103 @@ class NavEngine(threading.Thread):
 
                 # 🔽 LOWERED ELEVATION MASK (KEY FIX)
                 if alt.degrees > 5:
-                    sub = wgs84.subpoint(geo)
-                    vis.append({
+                    sp = wgs84.subpoint(geo)
+                    visible.append({
                         "name": str(sat.name),
-                        "el": round(alt.degrees,1),
-                        "az": round(az.degrees,1),
-                        "lat": sub.latitude.degrees,
-                        "lon": sub.longitude.degrees,
-                        "doppler": random.randint(-8000,8000),
-                        "tof": round(random.uniform(10,30),3)
+                        "el": round(alt.degrees, 1),
+                        "az": round(az.degrees, 1),
+                        "lat": sp.latitude.degrees,
+                        "lon": sp.longitude.degrees,
+                        "doppler": random.randint(-9000, 9000),
+                        "tof": round(random.uniform(10, 30), 3)
                     })
 
-            vis.sort(key=lambda x: x['el'], reverse=True)
-            state['sats'] = vis[:6]
-            state['status'] = f"TRACKING ({len(state['sats'])} SATS)"
-            state['fix'] = {
+            visible.sort(key=lambda x: x["el"], reverse=True)
+            state["sats"] = visible[:6]
+            state["status"] = f"TRACKING ({len(state['sats'])} SATS)"
+            state["fix"] = {
                 "lat": TRUE_LAT,
                 "lon": TRUE_LON,
                 "alt": int(TRUE_ALT),
-                "err": round(random.uniform(0.5,3.0),3),
+                "err": round(random.uniform(0.5, 3.0), 3),
                 "mode": "3D LOCK (ILS)"
             }
-            state['spectrum'] = [random.randint(10,50) for _ in range(40)]
+            state["spectrum"] = [random.randint(10, 50) for _ in range(40)]
             time.sleep(0.5)
 
 # ==========================================
-# 3. HUD HTML (UNCHANGED EXCEPT LOS GATING)
+# FULL HUD HTML (RESTORED + LOS GATED)
 # ==========================================
-HTML = """<!DOCTYPE html>
+HTML = """
+<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CROWN PNT</title>
+<title>CROWN PNT MISSION CONTROL</title>
 <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
 <style>
-body{margin:0;background:black;color:#0f0;font-family:monospace}
+body{margin:0;background:black;color:#00ff00;font-family:monospace}
 #map{height:100vh;width:100vw}
+.panel{position:absolute;border:1px solid #00ff00;padding:8px;background:rgba(0,0,0,0.8)}
+#nav{bottom:20px;left:20px}
+#sat{bottom:20px;right:20px;width:300px}
+#spec{top:20px;right:20px;width:260px}
+.bar{display:inline-block;width:5px;background:#00ff00;margin-right:2px}
 </style>
 </head>
 <body>
 <div id="map"></div>
+
+<div id="nav" class="panel">
+<b>POSITION</b><br>
+LAT: <span id="lat">--</span><br>
+LON: <span id="lon">--</span><br>
+ERR: <span id="err">--</span> m<br>
+MODE: <span id="mode">--</span>
+</div>
+
+<div id="spec" class="panel">
+<b>RF SPECTRUM</b><br>
+<div id="spectrum"></div>
+</div>
+
+<div id="sat" class="panel">
+<b>ACTIVE LEO</b>
+<div id="sattable"></div>
+</div>
+
 <script>
 var map=L.map('map').setView([12.97,80.04],5);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-var linkLayer=L.layerGroup().addTo(map);
+
 var satLayer=L.layerGroup().addTo(map);
+var linkLayer=L.layerGroup().addTo(map);
+var rx=L.circleMarker([12.97,80.04],{radius:6,color:'#0f0'}).addTo(map);
 
 function update(){
 fetch('/data').then(r=>r.json()).then(d=>{
-linkLayer.clearLayers(); satLayer.clearLayers();
+document.getElementById('lat').innerText=d.fix.lat.toFixed(6);
+document.getElementById('lon').innerText=d.fix.lon.toFixed(6);
+document.getElementById('err').innerText=d.fix.err;
+document.getElementById('mode').innerText=d.fix.mode;
+
+satLayer.clearLayers(); linkLayer.clearLayers();
+let table='';
 d.sats.forEach(s=>{
 L.circleMarker([s.lat,s.lon],{radius:4,color:'#0f0'}).addTo(satLayer);
+table+=`${s.name} EL:${s.el} AZ:${s.az}<br>`;
+
 if(map.getZoom()>=13){
 L.polyline([[d.fix.lat,d.fix.lon],[s.lat,s.lon]],
 {color:'#32CD32',opacity:0.6,weight:2}).addTo(linkLayer);
 }
 });
+document.getElementById('sattable').innerHTML=table;
+
+let bars='';
+d.spectrum.forEach(v=>bars+=`<div class="bar" style="height:${v}px"></div>`);
+document.getElementById('spectrum').innerHTML=bars;
 });
 }
 setInterval(update,1000); update();
@@ -216,20 +240,20 @@ setInterval(update,1000); update();
 """
 
 # ==========================================
-# 4. ROUTES
+# ROUTES
 # ==========================================
-@app.route('/')
+@app.route("/")
 def index():
     return render_template_string(HTML)
 
-@app.route('/data')
+@app.route("/data")
 def data():
     return jsonify(state)
 
 # ==========================================
-# 5. MAIN
+# MAIN
 # ==========================================
-if __name__ == '__main__':
+if __name__ == "__main__":
     NavEngine().start()
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host="0.0.0.0", port=5000)
 
