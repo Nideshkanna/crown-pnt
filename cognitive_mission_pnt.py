@@ -31,7 +31,6 @@ except Exception:
 TRUE_LAT = 12.9706089
 TRUE_LON = 80.0431389
 TRUE_ALT = 45.0  # meters
-
 SPEED_OF_LIGHT = 299792.458  # km/s
 
 app = Flask(__name__)
@@ -116,7 +115,6 @@ class NavEngine(threading.Thread):
             state['source'] = "LIVE NETWORK"
             log(f"CATALOG: Updated to {len(self.sats_catalog)} Live Targets.")
 
-    # ================= RTL-SDR SAFE INIT =================
     def init_radio(self):
         if not RTL_AVAILABLE:
             log("RF: RTL-SDR not available (Cloud / Simulation Mode).")
@@ -131,55 +129,9 @@ class NavEngine(threading.Thread):
         except Exception:
             log("RF: RTL-SDR init failed. Falling back to simulation.")
             self.sdr = None
-    # =====================================================
-
-    def lla_to_ecef(self, lat, lon, alt):
-        lat_r = math.radians(lat)
-        lon_r = math.radians(lon)
-        a = 6378.137
-        e2 = 0.00669437999
-        N = a / math.sqrt(1 - e2 * math.sin(lat_r) ** 2)
-        return np.array([
-            (N + alt/1000) * math.cos(lat_r) * math.cos(lon_r),
-            (N + alt/1000) * math.cos(lat_r) * math.sin(lon_r),
-            (N*(1-e2) + alt/1000) * math.sin(lat_r)
-        ])
-
-    def ecef_to_lla(self, x, y, z):
-        a = 6378.137
-        e2 = 0.00669437999
-        p = math.sqrt(x*x + y*y)
-        lon = math.atan2(y, x)
-        lat = math.atan2(z, p*(1-e2))
-        for _ in range(3):
-            N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
-            lat = math.atan2(z + e2*N*math.sin(lat), p)
-        alt = p/math.cos(lat) - N
-        return math.degrees(lat), math.degrees(lon), alt*1000
-
-    def solve_pnt(self, measurements):
-        X = np.zeros(4)
-        for _ in range(15):
-            H, r = [], []
-            for m in measurements:
-                d = np.linalg.norm(m['pos'] - X[:3])
-                los = (X[:3] - m['pos']) / max(d, 1e-6)
-                H.append([*los, 1])
-                r.append(m['pr'] - (d + X[3]))
-            H, r = np.array(H), np.array(r)
-            try:
-                dX = np.linalg.lstsq(H, r, rcond=None)[0]
-                X += dX
-                if np.linalg.norm(dX[:3]) < 0.001:
-                    break
-            except Exception:
-                return None
-        return X[:3]
 
     def run(self):
-        truth_ecef = self.lla_to_ecef(TRUE_LAT, TRUE_LON, TRUE_ALT)
         log(f"INIT: Target Lock set to {TRUE_LAT:.6f}, {TRUE_LON:.6f}")
-
         while True:
             state['spectrum'] = (
                 [random.randint(10, 50) for _ in range(40)]
@@ -188,11 +140,38 @@ class NavEngine(threading.Thread):
             time.sleep(0.5)
 
 # ==========================================
-# 3. WEB SERVER
+# 3. HUD INTERFACE (FULL UI)
+# ==========================================
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CROWN PNT MISSION CONTROL</title>
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <style>
+        body { margin:0; background:black; color:#00ff00; font-family: monospace; }
+        #map { height:100vh; width:100vw; }
+    </style>
+</head>
+<body>
+<div id="map"></div>
+<script>
+    var map = L.map('map').setView([12.9716, 80.0440], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    setInterval(() => fetch('/data'), 1000);
+</script>
+</body>
+</html>
+"""
+
+# ==========================================
+# 4. WEB SERVER ROUTES (FIXED)
 # ==========================================
 @app.route('/')
 def index():
-    return render_template_string("<h1>CROWN PNT MISSION CONTROL LIVE</h1>")
+    return render_template_string(HTML)
 
 @app.route('/data')
 def data():
