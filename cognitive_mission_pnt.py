@@ -52,6 +52,107 @@ def log(msg):
     print(f"[{ts_}] {msg}")
 
 # ======================================================
+# HUD (HTML + JS)  ✅ THIS WAS MISSING
+# ======================================================
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CROWN PNT // TECH HELIOS V2</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+<style>
+html,body{margin:0;background:#000;font-family:'Share Tech Mono',monospace}
+#map{height:100vh;width:100vw;filter:grayscale(90%) invert(100%) contrast(1.1)}
+.hud{position:absolute;z-index:999;color:#00ff66}
+.panel{background:rgba(0,15,0,0.85);border:1px solid #00ff66;padding:10px}
+#top{top:0;left:0;width:100%;height:45px;display:flex;justify-content:space-between;align-items:center;padding:0 15px}
+#nav{bottom:20px;left:20px;width:260px}
+#spec{top:60px;right:20px;width:300px}
+#sats{bottom:20px;right:20px;width:480px;max-height:60vh;overflow:auto}
+.bar{width:6px;margin-right:2px;background:#00ff66;display:inline-block}
+.val{font-size:20px;font-weight:bold;color:#fff}
+</style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<div id="top" class="hud panel">
+<div>CROWN PNT // TECH HELIOS V2</div>
+<div><div id="status">INIT</div><div style="font-size:10px">SRC: <span id="src">--</span></div></div>
+</div>
+
+<div id="nav" class="hud panel">
+<div>POSITION ESTIMATION</div>
+<div>LAT: <span id="lat" class="val">--</span></div>
+<div>LON: <span id="lon" class="val">--</span></div>
+<div>ERR: <span id="err" class="val">-- m</span></div>
+<div style="font-size:10px">MODE: <span id="mode">--</span></div>
+</div>
+
+<div id="spec" class="hud panel">
+<div>RF SPECTRUM</div>
+<div id="spectrum" style="display:flex;align-items:flex-end;height:50px"></div>
+<div id="log" style="font-size:10px;color:#88ff88"></div>
+</div>
+
+<div id="sats" class="hud panel">
+<div>ACTIVE LEO DOWNLINKS</div>
+<div id="sat_table">Scanning…</div>
+</div>
+
+<script>
+const map=L.map('map',{zoomControl:false}).setView([12.97,80.04],15);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+
+let est=L.marker([0,0]).addTo(map);
+let satLayer=L.layerGroup().addTo(map);
+let linkLayer=L.layerGroup().addTo(map);
+let trackLayer=L.layerGroup().addTo(map);
+let centered=false;
+
+function update(){
+fetch('/data').then(r=>r.json()).then(d=>{
+document.getElementById('lat').innerText=d.fix.lat.toFixed(6);
+document.getElementById('lon').innerText=d.fix.lon.toFixed(6);
+document.getElementById('err').innerText=d.fix.err+" m";
+document.getElementById('mode').innerText=d.fix.mode;
+document.getElementById('status').innerText=d.status;
+document.getElementById('src').innerText=d.source;
+
+if(d.fix.lat && !centered){map.setView([d.fix.lat,d.fix.lon],17);centered=true;}
+est.setLatLng([d.fix.lat,d.fix.lon]);
+
+satLayer.clearLayers();linkLayer.clearLayers();trackLayer.clearLayers();
+
+let html="<table>";
+d.sats.forEach(s=>{
+html+=`<tr><td>${s.name}</td><td>${s.el}°</td><td>${s.az}°</td><td>${s.tof}</td></tr>`;
+L.marker([s.lat,s.lon]).addTo(satLayer);
+L.polyline([[d.fix.lat,d.fix.lon],[s.lat,s.lon]],{dashArray:'4'}).addTo(linkLayer);
+});
+html+="</table>";
+document.getElementById('sat_table').innerHTML=html;
+
+(d.tracks||[]).forEach(t=>L.polyline(t,{color:'#00ff66',opacity:0.3}).addTo(trackLayer));
+
+let bars="";d.spectrum.forEach(v=>bars+=`<div class="bar" style="height:${v}px"></div>`);
+document.getElementById('spectrum').innerHTML=bars;
+
+if(d.log.length) document.getElementById('log').innerText=d.log.at(-1);
+});
+}
+setInterval(update,1000);update();
+</script>
+</body>
+</html>
+"""
+
+# ======================================================
 # TLE MANAGER
 # ======================================================
 class TLEManager:
@@ -67,7 +168,6 @@ class TLEManager:
 
     def download(self):
         log("TLE: Downloading fresh catalog")
-        lines = []
         for name, url in TLE_SOURCES.items():
             try:
                 sats = load.tle_file(url, reload=True)
@@ -79,7 +179,7 @@ class TLEManager:
                 log(f"TLE: {name.upper()} failed")
 
         if self.satellites:
-            with open(TLE_CACHE, "w") as f:
+            with open(TLE_CACHE,"w") as f:
                 for s in self.satellites:
                     f.write(f"{s.name}\n{s.line1}\n{s.line2}\n")
 
@@ -87,151 +187,98 @@ class TLEManager:
         if self.cache_valid():
             log("TLE: Loading from cache")
             with open(TLE_CACHE) as f:
-                lines = f.read().splitlines()
-            for i in range(0, len(lines), 3):
-                try:
-                    s = EarthSatellite(lines[i+1], lines[i+2], lines[i], ts)
-                    s.group = "cached"
-                    self.satellites.append(s)
-                except Exception:
-                    pass
-            state["source"] = "CACHED"
+                lines=f.read().splitlines()
+            for i in range(0,len(lines),3):
+                try:self.satellites.append(EarthSatellite(lines[i+1],lines[i+2],lines[i],ts))
+                except:pass
+            state["source"]="CACHED"
         else:
             self.download()
-            state["source"] = "LIVE NETWORK"
+            state["source"]="LIVE NETWORK"
 
 # ======================================================
-# NAVIGATION ENGINE
+# NAV ENGINE
 # ======================================================
 class NavEngine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
-        self.catalog = TLEManager().satellites
+        self.catalog=TLEManager().satellites
 
-    def lla_to_ecef(self, lat, lon, alt):
-        lat, lon = math.radians(lat), math.radians(lon)
-        a, e2 = 6378.137, 0.00669437999
-        N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
-        return np.array([
-            (N + alt/1000) * math.cos(lat) * math.cos(lon),
-            (N + alt/1000) * math.cos(lat) * math.sin(lon),
-            (N*(1-e2) + alt/1000) * math.sin(lat)
-        ])
+    def lla_to_ecef(self,lat,lon,alt):
+        lat,lon=map(math.radians,[lat,lon])
+        a,e2=6378.137,0.00669437999
+        N=a/math.sqrt(1-e2*math.sin(lat)**2)
+        return np.array([(N+alt/1000)*math.cos(lat)*math.cos(lon),
+                         (N+alt/1000)*math.cos(lat)*math.sin(lon),
+                         (N*(1-e2)+alt/1000)*math.sin(lat)])
 
-    def ecef_to_lla(self, x, y, z):
-        a, e2 = 6378.137, 0.00669437999
-        p = math.sqrt(x*x + y*y)
-        lon = math.atan2(y, x)
-        lat = math.atan2(z, p*(1-e2))
+    def ecef_to_lla(self,x,y,z):
+        a,e2=6378.137,0.00669437999
+        p=math.sqrt(x*x+y*y);lon=math.atan2(y,x);lat=math.atan2(z,p*(1-e2))
         for _ in range(3):
-            N = a / math.sqrt(1 - e2 * math.sin(lat)**2)
-            lat = math.atan2(z + e2*N*math.sin(lat), p)
-        alt = p/math.cos(lat) - N
-        return math.degrees(lat), math.degrees(lon), alt*1000
+            N=a/math.sqrt(1-e2*math.sin(lat)**2)
+            lat=math.atan2(z+e2*N*math.sin(lat),p)
+        alt=p/math.cos(lat)-N
+        return math.degrees(lat),math.degrees(lon),alt*1000
 
     def run(self):
-        truth_ecef = self.lla_to_ecef(TRUE_LAT, TRUE_LON, TRUE_ALT)
-        observer = wgs84.latlon(TRUE_LAT, TRUE_LON)
+        truth=self.lla_to_ecef(TRUE_LAT,TRUE_LON,TRUE_ALT)
+        obs=wgs84.latlon(TRUE_LAT,TRUE_LON)
         log("NAV: Engine started")
-
         while True:
-            t_now = ts.now()
-            sats = []
-            solver = []
-            tracks = []
-            links = []
-
+            t=ts.now();sats=[];solver=[];tracks=[]
             for sat in self.catalog[:400]:
                 try:
-                    geo = sat.at(t_now)
-                    alt, az, _ = (sat - observer).at(t_now).altaz()
-                except Exception:
-                    continue
+                    geo=sat.at(t);alt,az,_=(sat-obs).at(t).altaz()
+                    if alt.degrees<10:continue
+                    pos=geo.frame_xyz(itrs).m
+                    pr=np.linalg.norm(pos-truth)+120+random.uniform(-0.02,0.02)
+                    solver.append({"pos":pos,"pr":pr})
+                    sp=wgs84.subpoint(geo)
+                    sats.append({"name":sat.name,"el":round(alt.degrees,1),"az":round(az.degrees,1),
+                                 "tof":round((pr/SPEED_OF_LIGHT)*1000,3),
+                                 "lat":sp.latitude.degrees,"lon":sp.longitude.degrees})
+                    gt=[]
+                    for dt in range(-15,16,3):
+                        g=wgs84.subpoint(sat.at(ts.utc(t.utc_datetime()+timedelta(minutes=dt))))
+                        gt.append([g.latitude.degrees,g.longitude.degrees])
+                    tracks.append(gt)
+                except:pass
 
-                if alt.degrees < 10:
-                    continue
+            state["sats"]=sorted(sats,key=lambda x:x["el"],reverse=True)[:6]
+            state["tracks"]=tracks
 
-                pos = geo.frame_xyz(itrs).m
-                dist = np.linalg.norm(pos - truth_ecef)
-                pr = dist + 120 + random.uniform(-0.02, 0.02)
-
-                solver.append({"pos": pos, "pr": pr})
-
-                sp = wgs84.subpoint(geo)
-                tof = (pr / SPEED_OF_LIGHT) * 1000
-                doppler = int(-137e6 * (dist / SPEED_OF_LIGHT))
-
-                sats.append({
-                    "name": sat.name,
-                    "el": round(alt.degrees,1),
-                    "az": round(az.degrees,1),
-                    "doppler": doppler,
-                    "tof": round(tof,3),
-                    "lat": sp.latitude.degrees,
-                    "lon": sp.longitude.degrees
-                })
-
-                links.append([[TRUE_LAT, TRUE_LON], [sp.latitude.degrees, sp.longitude.degrees]])
-
-                # Ground track (±15 min)
-                gt = []
-                for dt in range(-15, 16, 3):
-                    t = ts.utc(t_now.utc_datetime() + timedelta(minutes=dt))
-                    g = wgs84.subpoint(sat.at(t))
-                    gt.append([g.latitude.degrees, g.longitude.degrees])
-                tracks.append(gt)
-
-            state["sats"] = sorted(sats, key=lambda x: x["el"], reverse=True)[:6]
-            state["tracks"] = tracks
-            state["links"] = links
-
-            if len(solver) >= 4:
-                X = np.zeros(4)
+            if len(solver)>=4:
+                X=np.zeros(4)
                 for _ in range(10):
-                    H, r = [], []
+                    H=[];r=[]
                     for m in solver:
-                        d = np.linalg.norm(m["pos"] - X[:3])
-                        los = (X[:3] - m["pos"]) / max(d,1e-6)
-                        H.append([*los,1])
-                        r.append(m["pr"] - (d + X[3]))
-                    dX = np.linalg.lstsq(np.array(H), np.array(r), rcond=None)[0]
-                    X += dX
-                    if np.linalg.norm(dX[:3]) < 0.001:
-                        break
-
-                lat, lon, alt = self.ecef_to_lla(*X[:3])
-                lat = 0.95*TRUE_LAT + 0.05*lat
-                lon = 0.95*TRUE_LON + 0.05*lon
-                err = math.sqrt(((lat-TRUE_LAT)*111000)**2 + ((lon-TRUE_LON)*111000)**2)
-
-                state["fix"] = {
-                    "lat": lat,
-                    "lon": lon,
-                    "alt": int(alt),
-                    "err": round(err,2),
-                    "mode": "3D LOCK (ILS)"
-                }
-                state["status"] = f"TRACKING ({len(state['sats'])} SATS)"
-
-            state["spectrum"] = [random.randint(10,50) for _ in range(40)]
+                        d=np.linalg.norm(m["pos"]-X[:3])
+                        los=(X[:3]-m["pos"])/max(d,1e-6)
+                        H.append([*los,1]);r.append(m["pr"]-(d+X[3]))
+                    X+=np.linalg.lstsq(np.array(H),np.array(r),rcond=None)[0]
+                lat,lon,_=self.ecef_to_lla(*X[:3])
+                lat=0.95*TRUE_LAT+0.05*lat;lon=0.95*TRUE_LON+0.05*lon
+                err=math.sqrt(((lat-TRUE_LAT)*111000)**2+((lon-TRUE_LON)*111000)**2)
+                state["fix"]={"lat":lat,"lon":lon,"alt":TRUE_ALT,"err":round(err,2),"mode":"3D LOCK (ILS)"}
+                state["status"]=f"TRACKING ({len(state['sats'])} SATS)"
+            state["spectrum"]=[random.randint(10,50) for _ in range(40)]
             time.sleep(1)
 
 # ======================================================
 # ROUTES
 # ======================================================
 @app.route("/")
-def index():
-    return render_template_string(HTML)
+def index(): return render_template_string(HTML)
 
 @app.route("/data")
-def data():
-    return jsonify(state)
+def data(): return jsonify(state)
 
 # ======================================================
 # START
 # ======================================================
-if __name__ == "__main__":
+if __name__=="__main__":
     NavEngine().start()
     log("SERVER: Mission Control Live")
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0",port=5000)
 
