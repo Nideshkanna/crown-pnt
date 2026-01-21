@@ -173,37 +173,201 @@ HTML = """
 <html>
 <head>
 <meta charset="utf-8">
-<title>CROWN PNT MISSION CONTROL</title>
+<title>CROWN PNT // TECH HELIOS V2</title>
+
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap" rel="stylesheet">
+
 <style>
-html,body,#map{height:100%;margin:0;}
-#hud{position:absolute;top:10px;left:10px;color:#0f0;background:#000a;padding:10px;font-family:monospace;z-index:1000}
+html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: #000;
+    font-family: 'Share Tech Mono', monospace;
+    color: #00ff66;
+}
+
+#map {
+    position: absolute;
+    inset: 0;
+    filter: grayscale(100%) contrast(1.2) brightness(0.8);
+}
+
+.hud {
+    position: absolute;
+    border: 1px solid #00ff66;
+    background: rgba(0, 20, 0, 0.85);
+    box-shadow: 0 0 15px rgba(0,255,120,0.3);
+    padding: 10px;
+}
+
+#title {
+    position: absolute;
+    top: 10px;
+    left: 20px;
+    font-size: 22px;
+    letter-spacing: 2px;
+}
+
+#status {
+    position: absolute;
+    top: 10px;
+    right: 20px;
+    text-align: right;
+}
+
+#radar {
+    top: 60px;
+    left: 20px;
+    width: 260px;
+    height: 260px;
+}
+
+#spectrum {
+    top: 60px;
+    right: 20px;
+    width: 300px;
+    height: 120px;
+}
+
+#position {
+    bottom: 20px;
+    left: 20px;
+    width: 300px;
+}
+
+#satlist {
+    bottom: 20px;
+    right: 20px;
+    width: 520px;
+    max-height: 55vh;
+    overflow-y: auto;
+}
+
+canvas {
+    background: rgba(0,0,0,0.4);
+}
+
+table {
+    width: 100%;
+    font-size: 12px;
+    border-collapse: collapse;
+}
+
+th {
+    border-bottom: 1px solid #00ff66;
+    text-align: left;
+}
+
+td {
+    padding: 3px 0;
+    color: #caffdf;
+}
+
+.bar {
+    width: 6px;
+    margin-right: 2px;
+    background: #00ff66;
+    display: inline-block;
+}
 </style>
 </head>
+
 <body>
+
 <div id="map"></div>
-<div id="hud">
-<div>Status: <span id="st">--</span></div>
-<div>Lat: <span id="lat">--</span></div>
-<div>Lon: <span id="lon">--</span></div>
-<div>Mode: <span id="mode">--</span></div>
+
+<div id="title">CROWN PNT // TECH HELIOS V2</div>
+
+<div id="status">
+    <div id="sys">BOOTING</div>
+    <div style="font-size:10px">SRC: <span id="src">--</span></div>
 </div>
+
+<div id="radar" class="hud">
+    <div style="font-size:12px;margin-bottom:5px;">AZ-EL RADAR</div>
+    <canvas id="radarCanvas" width="240" height="240"></canvas>
+</div>
+
+<div id="spectrum" class="hud">
+    <div style="font-size:12px;margin-bottom:5px;">RF SPECTRUM</div>
+    <div id="specBars" style="height:60px;display:flex;align-items:flex-end;"></div>
+</div>
+
+<div id="position" class="hud">
+    <div style="border-bottom:1px solid #00ff66;margin-bottom:8px;">POSITION ESTIMATION</div>
+    <div>LAT: <span id="lat">--</span></div>
+    <div>LON: <span id="lon">--</span></div>
+    <div>ERROR: <span id="err">--</span> m</div>
+    <div style="font-size:10px;">MODE: <span id="mode">--</span></div>
+</div>
+
+<div id="satlist" class="hud">
+    <div style="border-bottom:1px solid #00ff66;margin-bottom:6px;">ACTIVE LEO DOWNLINKS</div>
+    <div id="table">Waiting…</div>
+</div>
+
 <script>
-var map=L.map('map').setView([12.97,80.04],13);
+const map = L.map('map', { zoomControl:false }).setView([12.97,80.04], 15);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-var mk=L.marker([0,0]).addTo(map);
-function upd(){
+const fixMarker = L.circleMarker([0,0], { radius:8, color:'#00ff66' }).addTo(map);
+
+function drawRadar(sats){
+    const c = document.getElementById("radarCanvas");
+    const ctx = c.getContext("2d");
+    const R = 110;
+    ctx.clearRect(0,0,240,240);
+
+    ctx.strokeStyle = "#004422";
+    ctx.beginPath();
+    ctx.arc(120,120,R,0,Math.PI*2);
+    ctx.stroke();
+
+    sats.forEach(s=>{
+        const r = (90 - s.el) * (R/90);
+        const a = s.az * Math.PI/180;
+        const x = 120 + r * Math.sin(a);
+        const y = 120 - r * Math.cos(a);
+        ctx.fillStyle="#00ff66";
+        ctx.beginPath();
+        ctx.arc(x,y,4,0,Math.PI*2);
+        ctx.fill();
+    });
+}
+
+function update(){
 fetch('/data').then(r=>r.json()).then(d=>{
-document.getElementById('st').innerText=d.status;
-document.getElementById('lat').innerText=d.fix.lat.toFixed(6);
-document.getElementById('lon').innerText=d.fix.lon.toFixed(6);
-document.getElementById('mode').innerText=d.fix.mode;
-mk.setLatLng([d.fix.lat,d.fix.lon]);
+    document.getElementById('sys').innerText = d.status;
+    document.getElementById('src').innerText = d.source;
+    document.getElementById('lat').innerText = d.fix.lat.toFixed(6);
+    document.getElementById('lon').innerText = d.fix.lon.toFixed(6);
+    document.getElementById('err').innerText = d.fix.err;
+    document.getElementById('mode').innerText = d.fix.mode;
+
+    fixMarker.setLatLng([d.fix.lat, d.fix.lon]);
+    map.setView([d.fix.lat, d.fix.lon]);
+
+    drawRadar(d.sats);
+
+    let bars="";
+    d.spectrum.forEach(v=>bars+=`<div class="bar" style="height:${v}px"></div>`);
+    document.getElementById('specBars').innerHTML=bars;
+
+    let t="<table><tr><th>ID</th><th>EL</th><th>AZ</th><th>ToF</th></tr>";
+    d.sats.forEach(s=>{
+        t+=`<tr><td>${s.name}</td><td>${s.el}</td><td>${s.az}</td><td>${s.tof}</td></tr>`;
+    });
+    t+="</table>";
+    document.getElementById('table').innerHTML=t;
 });
 }
-setInterval(upd,1000);upd();
+setInterval(update,1000);
+update();
 </script>
+
 </body>
 </html>
 """
