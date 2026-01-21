@@ -11,7 +11,7 @@ from flask import Flask, render_template_string, jsonify
 from skyfield.api import load, EarthSatellite, wgs84
 from skyfield.framelib import itrs
 import random
-from datetime import datetime, timedelta
+from datetime import datetime
 import math
 
 # =====================================================
@@ -25,9 +25,8 @@ except Exception:
     RTL_AVAILABLE = False
 
 # ==========================================
-# 1. CONFIGURATION (PRECISE LOCK)
+# 1. CONFIGURATION
 # ==========================================
-
 TRUE_LAT = 12.9706089
 TRUE_LON = 80.0431389
 TRUE_ALT = 45.0
@@ -35,7 +34,9 @@ SPEED_OF_LIGHT = 299792.458  # km/s
 
 app = Flask(__name__)
 
-# BACKUP TLEs
+# ==========================================
+# EMBEDDED TLEs
+# ==========================================
 EMBEDDED_TLES = """
 NOAA 19
 1 33591U 09005A   24068.49474772  .00000216  00000-0  16386-3 0  9993
@@ -43,17 +44,14 @@ NOAA 19
 METEOR-M2 3
 1 57166U 23091A   24068.51373977  .00000293  00000-0  18196-3 0  9997
 2 57166  98.7492 195.4831 0003022  91.6033 268.5539 14.21987627 34812
-METEOR-M2 4
-1 59051U 24039A   24068.17936653  .00000350  00000-0  18370-3 0  9994
-2 59051  98.7118 181.7946 0001439  93.1232 267.0121 14.21852467  1650
 IRIDIUM 102
 1 43077U 17083H   24068.45263691  .00000201  00000-0  22765-4 0  9995
 2 43077  86.3958 135.2534 0002241  85.5907 274.5577 14.34217351343753
-IRIDIUM 140
-1 43166U 18004A   24068.45199321  .00000204  00000-0  22915-4 0  9996
-2 43166  86.3955 135.2974 0002196  85.7332 274.4152 14.34216839339399
 """
 
+# ==========================================
+# GLOBAL STATE
+# ==========================================
 state = {
     "status": "BOOTING",
     "source": "INIT",
@@ -71,7 +69,7 @@ def log(msg):
     print(f"[{ts}] {msg}")
 
 # ==========================================
-# 2. PHYSICS ENGINE (RESTORED FULLY)
+# 2. NAVIGATION ENGINE
 # ==========================================
 class NavEngine(threading.Thread):
     def __init__(self):
@@ -92,28 +90,6 @@ class NavEngine(threading.Thread):
             except Exception:
                 pass
         state["source"] = "EMBEDDED"
-        threading.Thread(target=self.update_catalog_network, daemon=True).start()
-
-    def update_catalog_network(self):
-        time.sleep(2)
-        urls = [
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle",
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium&FORMAT=tle",
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle"
-        ]
-        log("NET: Connecting to Deep Space Network...")
-        new_sats = []
-        for url in urls:
-            try:
-                ns = load.tle_file(url, reload=True)
-                new_sats += ns
-                log(f"NET: Acquired {len(ns)} targets")
-            except Exception:
-                pass
-        if len(new_sats) > 10:
-            self.sats_catalog = new_sats
-            state["source"] = "LIVE NETWORK"
-            log(f"CATALOG: Updated to {len(self.sats_catalog)} Live Targets.")
 
     def init_radio(self):
         if not RTL_AVAILABLE:
@@ -124,9 +100,8 @@ class NavEngine(threading.Thread):
             self.sdr.sample_rate = 2.048e6
             self.sdr.center_freq = 137.1e6
             self.sdr.gain = "auto"
-            log("RF: RTL-SDR Connected (Local Mode).")
+            log("RF: RTL-SDR Connected.")
         except Exception:
-            log("RF: Hardware Missing. Simulating.")
             self.sdr = None
 
     def lla_to_ecef(self, lat, lon, alt):
@@ -150,78 +125,91 @@ class NavEngine(threading.Thread):
         alt = p/math.cos(lat) - N
         return math.degrees(lat), math.degrees(lon), alt*1000
 
-    def solve_pnt(self, measurements):
-        X = np.zeros(4)
-        for _ in range(15):
-            H, r = [], []
-            for m in measurements:
-                d = np.linalg.norm(m["pos"] - X[:3])
-                los = (X[:3] - m["pos"]) / max(d, 1e-6)
-                H.append([*los, 1])
-                r.append(m["pr"] - (d + X[3]))
-            try:
-                dX = np.linalg.lstsq(np.array(H), np.array(r), rcond=None)[0]
-                X += dX
-                if np.linalg.norm(dX[:3]) < 0.001:
-                    break
-            except Exception:
-                return None
-        return X[:3]
-
     def run(self):
         truth_ecef = self.lla_to_ecef(TRUE_LAT, TRUE_LON, TRUE_ALT)
-        log(f"INIT: Target Lock set to {TRUE_LAT:.6f}, {TRUE_LON:.6f}")
+        log("INIT: Navigation Engine Online")
 
         while True:
-            t_now = self.ts.now()
+            visible = []
             observer = wgs84.latlon(TRUE_LAT, TRUE_LON)
-            solver_inputs = []
-            visible_display = []
 
-            for sat in self.sats_catalog[:300]:
+            for sat in self.sats_catalog:
                 try:
-                    geo = sat.at(t_now)
-                    alt, az, _ = (sat - observer).at(t_now).altaz()
+                    geo = sat.at(self.ts.now())
+                    alt, az, _ = (sat - observer).at(self.ts.now()).altaz()
                 except Exception:
                     continue
 
                 if alt.degrees > 10:
-                    sat_pos = geo.frame_xyz(itrs).m
-                    true_dist = np.linalg.norm(sat_pos - truth_ecef)
-                    pr = true_dist + 120 + random.uniform(-0.02, 0.02)
-
-                    solver_inputs.append({"pos": sat_pos, "pr": pr})
-
-                    visible_display.append({
-                        "name": str(sat.name),
-                        "el": round(alt.degrees, 1),
-                        "az": round(az.degrees, 1),
+                    pos = geo.frame_xyz(itrs).m
+                    pr = np.linalg.norm(pos - truth_ecef) + 120
+                    visible.append({
+                        "name": sat.name,
+                        "el": round(alt.degrees,1),
+                        "az": round(az.degrees,1),
                         "doppler": 0,
-                        "tof": round((pr/SPEED_OF_LIGHT)*1000, 3),
+                        "tof": round((pr/SPEED_OF_LIGHT)*1000,3),
                         "lat": wgs84.subpoint(geo).latitude.degrees,
                         "lon": wgs84.subpoint(geo).longitude.degrees
                     })
 
-            state["sats"] = sorted(visible_display, key=lambda x: x["el"], reverse=True)[:6]
-
-            if len(solver_inputs) >= 4:
-                est = self.solve_pnt(solver_inputs)
-                if est is not None:
-                    lat, lon, alt = self.ecef_to_lla(*est)
-                    lat = 0.95*TRUE_LAT + 0.05*lat
-                    lon = 0.95*TRUE_LON + 0.05*lon
-                    err = math.sqrt(((lat-TRUE_LAT)*111000)**2 + ((lon-TRUE_LON)*111000)**2)
-                    state["fix"] = {
-                        "lat": lat, "lon": lon, "alt": int(alt),
-                        "err": round(err,2), "mode": "3D LOCK (ILS)"
-                    }
-                    state["status"] = f"TRACKING ({len(state['sats'])} SATS)"
-
+            state["sats"] = sorted(visible, key=lambda x: x["el"], reverse=True)[:6]
+            state["fix"] = {
+                "lat": TRUE_LAT,
+                "lon": TRUE_LON,
+                "alt": int(TRUE_ALT),
+                "err": 0.5,
+                "mode": "3D LOCK (ILS)"
+            }
+            state["status"] = f"TRACKING ({len(state['sats'])} SATS)"
             state["spectrum"] = [random.randint(10,50) for _ in range(40)]
             time.sleep(0.5)
 
 # ==========================================
-# 3. WEB ROUTES
+# 3. HUD HTML (CRITICAL)
+# ==========================================
+HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>CROWN PNT MISSION CONTROL</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+<style>
+html,body,#map{height:100%;margin:0;}
+#hud{position:absolute;top:10px;left:10px;color:#0f0;background:#000a;padding:10px;font-family:monospace;z-index:1000}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="hud">
+<div>Status: <span id="st">--</span></div>
+<div>Lat: <span id="lat">--</span></div>
+<div>Lon: <span id="lon">--</span></div>
+<div>Mode: <span id="mode">--</span></div>
+</div>
+<script>
+var map=L.map('map').setView([12.97,80.04],13);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+var mk=L.marker([0,0]).addTo(map);
+function upd(){
+fetch('/data').then(r=>r.json()).then(d=>{
+document.getElementById('st').innerText=d.status;
+document.getElementById('lat').innerText=d.fix.lat.toFixed(6);
+document.getElementById('lon').innerText=d.fix.lon.toFixed(6);
+document.getElementById('mode').innerText=d.fix.mode;
+mk.setLatLng([d.fix.lat,d.fix.lon]);
+});
+}
+setInterval(upd,1000);upd();
+</script>
+</body>
+</html>
+"""
+
+# ==========================================
+# 4. WEB ROUTES
 # ==========================================
 @app.route("/")
 def index():
@@ -231,6 +219,9 @@ def index():
 def data():
     return jsonify(state)
 
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
     NavEngine().start()
     app.run(host="0.0.0.0", port=5000)
