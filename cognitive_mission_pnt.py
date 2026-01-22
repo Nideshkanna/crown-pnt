@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 """
-CROWN-PNT Mission Control – Corrected Build
+CROWN-PNT Mission Control – Render-Safe Build
 """
 
 import time
 import random
 import threading
 from datetime import datetime
+from pathlib import Path
 
 from flask import Flask, jsonify, render_template_string
 from skyfield.api import load, EarthSatellite, wgs84
 
-# ================= CONFIG =================
 LAT = 12.970609
 LON = 80.043139
 ALT = 45.0
 MIN_EL = 5.0
-C = 299792.458
 
 app = Flask(__name__)
 
@@ -28,29 +27,58 @@ state = {
 }
 
 def log(msg):
-    print(f"[{datetime.utcnow().isoformat()}] {msg}")
+    print(f"[{datetime.utcnow().isoformat()}] {msg}", flush=True)
 
 # ================= SAT ENGINE =================
 class NavEngine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.ts = load.timescale()
-        self.sats = []
-        self.load_tles()
+        self.sats = self.load_sats()
 
-    def load_tles(self):
+    def load_sats(self):
+        sats = []
+
+        # 1️⃣ Try internet TLEs
         urls = [
             "https://celestrak.org/NORAD/elements/oneweb.txt",
             "https://celestrak.org/NORAD/elements/iridium.txt",
-            "https://celestrak.org/NORAD/elements/weather.txt",
         ]
         for url in urls:
             try:
-                self.sats += load.tle_file(url, reload=True)[:15]
-                log(f"TLE loaded: {url}")
-            except Exception:
-                pass
-        log(f"Total sats: {len(self.sats)}")
+                sats += load.tle_file(url, reload=True)
+                log(f"TLE fetched: {url}")
+            except Exception as e:
+                log(f"TLE fetch failed: {url}")
+
+        # 2️⃣ Fallback to local cache
+        if not sats:
+            tle_file = Path("tle_cache.txt")
+            if tle_file.exists():
+                log("Using cached TLE file")
+                lines = tle_file.read_text().splitlines()
+                for i in range(0, len(lines), 3):
+                    try:
+                        sats.append(
+                            EarthSatellite(lines[i+1], lines[i+2], lines[i], self.ts)
+                        )
+                    except Exception:
+                        pass
+
+        # 3️⃣ Absolute failsafe (demo satellites)
+        if not sats:
+            log("Injecting demo satellites")
+            sats.append(
+                EarthSatellite(
+                    "1 25544U 98067A   24022.51782528  .00012000  00000-0  22000-3 0  9990",
+                    "2 25544  51.6400  25.0000 0006000  10.0000  80.0000 15.50000000    12",
+                    "DEMO-SAT",
+                    self.ts,
+                )
+            )
+
+        log(f"Total sats loaded: {len(sats)}")
+        return sats[:20]
 
     def run(self):
         obs = wgs84.latlon(LAT, LON)
@@ -74,16 +102,15 @@ class NavEngine(threading.Thread):
                     pass
 
             state["sats"] = visible
-            state["fix"]["err"] = round(random.uniform(0.5, 2.5), 2)
+            state["fix"]["err"] = round(random.uniform(0.8, 2.2), 2)
             state["fix"]["mode"] = "3D LOCK (ILS)"
-            state["spectrum"] = [random.randint(10, 60) for _ in range(48)]
+            state["spectrum"] = [random.randint(5, 60) for _ in range(48)]
             state["status"] = f"TRACKING {len(visible)} SATS"
 
             time.sleep(1)
 
 # ================= FRONTEND =================
-HTML = """
-<!DOCTYPE html>
+HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
@@ -131,8 +158,7 @@ linkLayer.clearLayers();
 list.innerHTML="";
 
 d.sats.forEach(s=>{
-var m=L.circleMarker([s.lat,s.lon],{radius:4,color:'#0f0'});
-satLayer.addLayer(m);
+satLayer.addLayer(L.circleMarker([s.lat,s.lon],{radius:4,color:'#0f0'}));
 linkLayer.addLayer(L.polyline([[12.970609,80.043139],[s.lat,s.lon]],{color:'#0f0',weight:1}));
 list.innerHTML+=`${s.name}<br>`;
 });
@@ -140,15 +166,12 @@ list.innerHTML+=`${s.name}<br>`;
 spec.innerHTML=d.spectrum.map(v=>"▮").join("");
 });
 }
-
 setInterval(update,1000);
 update();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
-# ================= ROUTES =================
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -157,7 +180,6 @@ def index():
 def data():
     return jsonify(state)
 
-# ================= MAIN =================
 if __name__ == "__main__":
     NavEngine().start()
     app.run(host="0.0.0.0", port=5000)
