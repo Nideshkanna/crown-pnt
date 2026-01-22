@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-cognitive_mission_pnt.py
-CROWN PNT – Mission Control (Render-safe, HUD-restored)
+CROWN-PNT : Mission Control (Stable Demo Build)
 """
 
-import time
-import threading
+import time, threading, math, random
 import numpy as np
+from datetime import datetime, timedelta
 from flask import Flask, render_template_string, jsonify
 from skyfield.api import load, EarthSatellite, wgs84
 from skyfield.framelib import itrs
-import random
-from datetime import datetime, timedelta
-import math
 
-# =====================================================
-# OPTIONAL RTL-SDR SUPPORT (SAFE FOR CLOUD)
-# =====================================================
-try:
-    from rtlsdr import RtlSdr
-    RTL_AVAILABLE = True
-except Exception:
-    RtlSdr = None
-    RTL_AVAILABLE = False
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
-TRUE_LAT = 12.9706089
-TRUE_LON = 80.0431389
+# ================= CONFIG =================
+TRUE_LAT = 12.970609
+TRUE_LON = 80.043139
 TRUE_ALT = 45.0
-SPEED_OF_LIGHT = 299792.458  # km/s
+SPEED_OF_LIGHT = 299792.458
 
 app = Flask(__name__)
 
-# ==========================================
-# EMBEDDED TLEs
-# ==========================================
+# =============== STATE ====================
+state = {
+    "status": "BOOTING",
+    "source": "EMBEDDED",
+    "sats": [],
+    "fix": {"lat": TRUE_LAT, "lon": TRUE_LON, "alt": TRUE_ALT, "err": 0, "mode": "INIT"},
+    "log": [],
+    "spectrum": [10]*40
+}
+
+def log(msg):
+    ts = datetime.now().strftime("%H:%M:%S")
+    state["log"].append(f"[{ts}] {msg}")
+    state["log"] = state["log"][-10:]
+    print(msg)
+
+# ============== EMBEDDED TLES ==============
 EMBEDDED_TLES = """
 NOAA 19
 1 33591U 09005A   24068.49474772  .00000216  00000-0  16386-3 0  9993
@@ -47,213 +45,145 @@ METEOR-M2 3
 IRIDIUM 102
 1 43077U 17083H   24068.45263691  .00000201  00000-0  22765-4 0  9995
 2 43077  86.3958 135.2534 0002241  85.5907 274.5577 14.34217351343753
-IRIDIUM 140
-1 43166U 18004A   24068.45199321  .00000204  00000-0  22915-4 0  9996
-2 43166  86.3955 135.2974 0002196  85.7332 274.4152 14.34216839339399
 """
 
-# ==========================================
-# GLOBAL STATE
-# ==========================================
-state = {
-    "status": "BOOTING",
-    "source": "INIT",
-    "sats": [],
-    "fix": {"lat": 0.0, "lon": 0.0, "alt": 0, "err": 0, "mode": "INIT"},
-    "log": [],
-    "spectrum": [10] * 40
-}
-
-def log(msg):
-    ts = datetime.now().strftime("%H:%M:%S")
-    state["log"].append(f"[{ts}] {msg}")
-    state["log"] = state["log"][-10:]
-    print(f"[{ts}] {msg}")
-
-# ==========================================
-# NAV ENGINE
-# ==========================================
+# ================= ENGINE ==================
 class NavEngine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.ts = load.timescale()
-        self.sats = []
-        self.init_catalog()
-        self.init_radio()
+        self.catalog = []
+        self.load_embedded()
+        threading.Thread(target=self.load_live, daemon=True).start()
 
-    def init_catalog(self):
-        log("CATALOG: Loading embedded TLEs")
-        lines = EMBEDDED_TLES.strip().splitlines()
-        for i in range(0, len(lines), 3):
+    def load_embedded(self):
+        for i in range(0, len(EMBEDDED_TLES.strip().splitlines()), 3):
             try:
-                self.sats.append(EarthSatellite(
-                    lines[i+1], lines[i+2], lines[i], self.ts
-                ))
-            except Exception:
+                l = EMBEDDED_TLES.strip().splitlines()
+                self.catalog.append(EarthSatellite(l[i+1], l[i+2], l[i], self.ts))
+            except:
                 pass
-        state["source"] = "EMBEDDED"
-        threading.Thread(target=self.update_catalog_network, daemon=True).start()
+        log("Embedded catalog loaded")
 
-    def update_catalog_network(self):
-        time.sleep(2)
-        urls = [
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=weather&FORMAT=tle",
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium&FORMAT=tle",
-            "https://celestrak.org/NORAD/elements/gp.php?GROUP=oneweb&FORMAT=tle"
-        ]
-        sats = []
-        for u in urls:
+    def load_live(self):
+        time.sleep(3)
+        urls = {
+            "weather": "https://celestrak.org/NORAD/elements/weather.txt",
+            "iridium": "https://celestrak.org/NORAD/elements/iridium.txt",
+            "oneweb": "https://celestrak.org/NORAD/elements/oneweb.txt"
+        }
+        merged = self.catalog[:]
+        for k,u in urls.items():
             try:
-                sats += load.tle_file(u, reload=True)
-            except Exception:
+                sats = load.tle_file(u, reload=True)
+                merged += sats[:20]
+                log(f"Loaded {k.upper()} sats")
+            except:
                 pass
-        if len(sats) > 10:
-            self.sats = sats
-            state["source"] = "LIVE NETWORK"
-            log(f"CATALOG: {len(sats)} live satellites")
-
-    def init_radio(self):
-        if not RTL_AVAILABLE:
-            log("RF: RTL-SDR unavailable (simulation)")
-            return
+        self.catalog = merged
+        state["source"] = "LIVE+EMBEDDED"
 
     def run(self):
         obs = wgs84.latlon(TRUE_LAT, TRUE_LON)
-        log(f"INIT: Target Lock {TRUE_LAT:.6f}, {TRUE_LON:.6f}")
+        truth_ecef = np.array(wgs84.latlon(TRUE_LAT, TRUE_LON).itrs_xyz.m)
 
         while True:
-            t = self.ts.now()
+            now = self.ts.now()
             visible = []
 
-            for sat in self.sats:
+            for sat in self.catalog:
                 try:
-                    geo = sat.at(t)
-                    alt, az, _ = (sat - obs).at(t).altaz()
-                except Exception:
-                    continue
+                    alt, az, _ = (sat - obs).at(now).altaz()
+                    if alt.degrees > 10:
+                        geo = sat.at(now)
+                        sub = wgs84.subpoint(geo)
+                        visible.append({
+                            "name": sat.name,
+                            "el": round(alt.degrees,1),
+                            "az": round(az.degrees,1),
+                            "lat": sub.latitude.degrees,
+                            "lon": sub.longitude.degrees,
+                            "tof": round(np.linalg.norm(geo.frame_xyz(itrs).m - truth_ecef)/SPEED_OF_LIGHT*1000,2),
+                            "doppler": random.randint(-2000,2000)
+                        })
+                except:
+                    pass
 
-                # 🔽 LOWERED ELEVATION MASK (KEY FIX)
-                if alt.degrees > 5:
-                    sp = wgs84.subpoint(geo)
-                    visible.append({
-                        "name": str(sat.name),
-                        "el": round(alt.degrees, 1),
-                        "az": round(az.degrees, 1),
-                        "lat": sp.latitude.degrees,
-                        "lon": sp.longitude.degrees,
-                        "doppler": random.randint(-9000, 9000),
-                        "tof": round(random.uniform(10, 30), 3)
-                    })
+            visible = sorted(visible, key=lambda x: x["el"], reverse=True)[:6]
+            state["sats"] = visible
+            state["status"] = f"TRACKING ({len(visible)} SATS)"
+            state["fix"]["mode"] = "3D LOCK (ILS)"
+            state["fix"]["lat"] = TRUE_LAT
+            state["fix"]["lon"] = TRUE_LON
+            state["fix"]["err"] = round(random.uniform(0.5,3.0),2)
+            state["spectrum"] = [random.randint(10,50) for _ in range(40)]
+            time.sleep(1)
 
-            visible.sort(key=lambda x: x["el"], reverse=True)
-            state["sats"] = visible[:6]
-            state["status"] = f"TRACKING ({len(state['sats'])} SATS)"
-            state["fix"] = {
-                "lat": TRUE_LAT,
-                "lon": TRUE_LON,
-                "alt": int(TRUE_ALT),
-                "err": round(random.uniform(0.5, 3.0), 3),
-                "mode": "3D LOCK (ILS)"
-            }
-            state["spectrum"] = [random.randint(10, 50) for _ in range(40)]
-            time.sleep(0.5)
-
-# ==========================================
-# FULL HUD HTML (RESTORED + LOS GATED)
-# ==========================================
-HTML = """
-<!DOCTYPE html>
+# ================= HTML ====================
+HTML = """<!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CROWN PNT MISSION CONTROL</title>
-<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+<title>CROWN PNT</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
 <style>
-body{margin:0;background:black;color:#00ff00;font-family:monospace}
-#map{height:100vh;width:100vw}
-.panel{position:absolute;border:1px solid #00ff00;padding:8px;background:rgba(0,0,0,0.8)}
-#nav{bottom:20px;left:20px}
-#sat{bottom:20px;right:20px;width:300px}
-#spec{top:20px;right:20px;width:260px}
-.bar{display:inline-block;width:5px;background:#00ff00;margin-right:2px}
+html,body,#map{height:100%;margin:0;}
+#map{filter:contrast(1.2) brightness(0.7);}
+.hud{position:fixed;z-index:999;color:#00ff00;
+background:rgba(0,0,0,0.8);border:1px solid #00ff00;
+font-family:monospace;padding:8px;}
+#pos{bottom:20px;left:20px;}
+#sat{bottom:20px;right:20px;}
+#rf{top:20px;right:20px;}
 </style>
 </head>
 <body>
 <div id="map"></div>
 
-<div id="nav" class="panel">
+<div id="pos" class="hud">
 <b>POSITION</b><br>
-LAT: <span id="lat">--</span><br>
-LON: <span id="lon">--</span><br>
-ERR: <span id="err">--</span> m<br>
-MODE: <span id="mode">--</span>
+LAT <span id="lat"></span><br>
+LON <span id="lon"></span><br>
+ERR <span id="err"></span> m<br>
+MODE <span id="mode"></span>
 </div>
 
-<div id="spec" class="panel">
-<b>RF SPECTRUM</b><br>
-<div id="spectrum"></div>
-</div>
-
-<div id="sat" class="panel">
-<b>ACTIVE LEO</b>
-<div id="sattable"></div>
-</div>
+<div id="sat" class="hud"><b>ACTIVE LEO</b><div id="sats"></div></div>
+<div id="rf" class="hud"><b>RF SPECTRUM</b><div id="spec"></div></div>
 
 <script>
-var map=L.map('map').setView([12.97,80.04],5);
+var map=L.map('map',{zoomControl:true}).setView([12.970609,80.043139],13);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-
-var satLayer=L.layerGroup().addTo(map);
-var linkLayer=L.layerGroup().addTo(map);
-var rx=L.circleMarker([12.97,80.04],{radius:6,color:'#0f0'}).addTo(map);
+var fix=L.circleMarker([12.970609,80.043139],{radius:6,color:'#00ff00'}).addTo(map);
 
 function update(){
 fetch('/data').then(r=>r.json()).then(d=>{
-document.getElementById('lat').innerText=d.fix.lat.toFixed(6);
-document.getElementById('lon').innerText=d.fix.lon.toFixed(6);
-document.getElementById('err').innerText=d.fix.err;
-document.getElementById('mode').innerText=d.fix.mode;
+lat.innerText=d.fix.lat.toFixed(6);
+lon.innerText=d.fix.lon.toFixed(6);
+err.innerText=d.fix.err;
+mode.innerText=d.fix.mode;
 
-satLayer.clearLayers(); linkLayer.clearLayers();
-let table='';
-d.sats.forEach(s=>{
-L.circleMarker([s.lat,s.lon],{radius:4,color:'#0f0'}).addTo(satLayer);
-table+=`${s.name} EL:${s.el} AZ:${s.az}<br>`;
+sats.innerHTML="";
+d.sats.forEach(s=>sats.innerHTML+=`${s.name} EL:${s.el}<br>`);
 
-if(map.getZoom()>=13){
-L.polyline([[d.fix.lat,d.fix.lon],[s.lat,s.lon]],
-{color:'#32CD32',opacity:0.6,weight:2}).addTo(linkLayer);
-}
-});
-document.getElementById('sattable').innerHTML=table;
-
-let bars='';
-d.spectrum.forEach(v=>bars+=`<div class="bar" style="height:${v}px"></div>`);
-document.getElementById('spectrum').innerHTML=bars;
+spec.innerHTML=d.spectrum.map(x=>`▮`).join("");
 });
 }
-setInterval(update,1000); update();
+setInterval(update,1000);update();
 </script>
 </body>
-</html>
-"""
+</html>"""
 
-# ==========================================
-# ROUTES
-# ==========================================
+# ================= ROUTES ==================
 @app.route("/")
-def index():
-    return render_template_string(HTML)
+def index(): return render_template_string(HTML)
 
 @app.route("/data")
-def data():
-    return jsonify(state)
+def data(): return jsonify(state)
 
-# ==========================================
-# MAIN
-# ==========================================
-if __name__ == "__main__":
+# ================= MAIN ====================
+if __name__=="__main__":
     NavEngine().start()
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0",port=5000)
 
