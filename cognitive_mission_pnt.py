@@ -1,216 +1,154 @@
 #!/usr/bin/env python3
 """
-CROWN-PNT Mission Control
-Render-safe, Satellite-stable build
+CROWN-PNT Mission Control – Corrected Build
 """
 
 import time
-import math
 import random
 import threading
 from datetime import datetime
 
-import numpy as np
 from flask import Flask, jsonify, render_template_string
 from skyfield.api import load, EarthSatellite, wgs84
-from skyfield.framelib import itrs
 
-# ======================================================
-# CONFIG
-# ======================================================
-TRUE_LAT = 12.970609
-TRUE_LON = 80.043139
-TRUE_ALT = 45.0
-MIN_ELEVATION = 5.0
-SPEED_OF_LIGHT = 299792.458
+# ================= CONFIG =================
+LAT = 12.970609
+LON = 80.043139
+ALT = 45.0
+MIN_EL = 5.0
+C = 299792.458
 
 app = Flask(__name__)
 
-# ======================================================
-# STATE
-# ======================================================
 state = {
-    "status": "BOOTING",
-    "source": "EMBEDDED",
+    "fix": {"lat": LAT, "lon": LON, "alt": ALT, "err": 0.0, "mode": "INIT"},
     "sats": [],
-    "fix": {
-        "lat": TRUE_LAT,
-        "lon": TRUE_LON,
-        "alt": TRUE_ALT,
-        "err": 0.0,
-        "mode": "INIT"
-    },
     "spectrum": [10] * 48,
-    "log": []
+    "status": "BOOTING",
 }
 
 def log(msg):
-    ts = datetime.utcnow().strftime("%H:%M:%S")
-    print(msg)
-    state["log"].append(f"[{ts}] {msg}")
-    state["log"] = state["log"][-12:]
+    print(f"[{datetime.utcnow().isoformat()}] {msg}")
 
-# ======================================================
-# EMBEDDED TLEs (DEMO-SAFE)
-# ======================================================
-EMBEDDED_TLES = [
-    (
-        "NOAA 19",
-        "1 33591U 09005A   24068.49474772  .00000216  00000-0  16386-3 0  9993",
-        "2 33591  99.0396 244.6427 0013346 179.9299 180.1884 14.12658828779632",
-    ),
-    (
-        "METEOR-M2 3",
-        "1 57166U 23091A   24068.51373977  .00000293  00000-0  18196-3 0  9997",
-        "2 57166  98.7492 195.4831 0003022  91.6033 268.5539 14.21987627 34812",
-    ),
-    (
-        "IRIDIUM 102",
-        "1 43077U 17083H   24068.45263691  .00000201  00000-0  22765-4 0  9995",
-        "2 43077  86.3958 135.2534 0002241  85.5907 274.5577 14.34217351343753",
-    ),
-]
-
-# ======================================================
-# NAV ENGINE
-# ======================================================
+# ================= SAT ENGINE =================
 class NavEngine(threading.Thread):
     def __init__(self):
         super().__init__(daemon=True)
         self.ts = load.timescale()
-        self.catalog = []
-        self.load_embedded()
-        self.load_live()
+        self.sats = []
+        self.load_tles()
 
-    def load_embedded(self):
-        for name, l1, l2 in EMBEDDED_TLES:
-            self.catalog.append(EarthSatellite(l1, l2, name, self.ts))
-        log(f"Embedded satellites loaded: {len(self.catalog)}")
-
-    def load_live(self):
-        urls = {
-            "ONEWEB": "https://celestrak.org/NORAD/elements/oneweb.txt",
-            "IRIDIUM": "https://celestrak.org/NORAD/elements/iridium.txt",
-            "WEATHER": "https://celestrak.org/NORAD/elements/weather.txt",
-        }
-
-        for tag, url in urls.items():
+    def load_tles(self):
+        urls = [
+            "https://celestrak.org/NORAD/elements/oneweb.txt",
+            "https://celestrak.org/NORAD/elements/iridium.txt",
+            "https://celestrak.org/NORAD/elements/weather.txt",
+        ]
+        for url in urls:
             try:
-                sats = load.tle_file(url, reload=True)
-                self.catalog.extend(sats[:20])
-                state["source"] = "LIVE + EMBEDDED"
-                log(f"{tag} loaded: {len(sats)}")
+                self.sats += load.tle_file(url, reload=True)[:15]
+                log(f"TLE loaded: {url}")
             except Exception:
-                log(f"{tag} load failed, continuing with embedded")
-
-        log(f"Total catalog size: {len(self.catalog)}")
+                pass
+        log(f"Total sats: {len(self.sats)}")
 
     def run(self):
-        observer = wgs84.latlon(TRUE_LAT, TRUE_LON)
-        truth_ecef = np.array(observer.itrs_xyz.m)
-
+        obs = wgs84.latlon(LAT, LON)
         while True:
             now = self.ts.now()
             visible = []
 
-            for sat in self.catalog:
+            for sat in self.sats:
                 try:
-                    alt, az, _ = (sat - observer).at(now).altaz()
-                    if alt.degrees >= MIN_ELEVATION:
-                        geo = sat.at(now)
-                        sub = wgs84.subpoint(geo)
-                        dist = np.linalg.norm(
-                            geo.frame_xyz(itrs).m - truth_ecef
-                        )
+                    alt, az, _ = (sat - obs).at(now).altaz()
+                    if alt.degrees > MIN_EL:
+                        sub = wgs84.subpoint(sat.at(now))
                         visible.append({
                             "name": sat.name,
                             "el": round(alt.degrees, 1),
                             "az": round(az.degrees, 1),
-                            "lat": round(sub.latitude.degrees, 4),
-                            "lon": round(sub.longitude.degrees, 4),
-                            "tof": round(dist / SPEED_OF_LIGHT * 1000, 2)
+                            "lat": sub.latitude.degrees,
+                            "lon": sub.longitude.degrees,
                         })
                 except Exception:
                     pass
 
-            visible = sorted(visible, key=lambda x: x["el"], reverse=True)[:8]
-
             state["sats"] = visible
-            state["status"] = f"TRACKING ({len(visible)} SATS)"
-            state["fix"]["mode"] = "3D LOCK (ILS)"
             state["fix"]["err"] = round(random.uniform(0.5, 2.5), 2)
-            state["spectrum"] = [random.randint(8, 55) for _ in range(48)]
+            state["fix"]["mode"] = "3D LOCK (ILS)"
+            state["spectrum"] = [random.randint(10, 60) for _ in range(48)]
+            state["status"] = f"TRACKING {len(visible)} SATS"
 
             time.sleep(1)
 
-# ======================================================
-# HTML (HUD LOCKED, NO FLICKER)
-# ======================================================
+# ================= FRONTEND =================
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>CROWN PNT</title>
+<meta charset="utf-8">
+<title>CROWN-PNT</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
 <style>
-html,body,#map{height:100%;margin:0;background:#000;}
-.hud{
-position:fixed;z-index:9999;
-color:#00ff00;background:rgba(0,0,0,0.85);
-border:1px solid #00ff00;
-font-family:monospace;
-padding:8px;font-size:12px;
-}
+html,body,#map{height:100%;margin:0;background:black;}
+.hud{position:fixed;color:#0f0;background:rgba(0,0,0,.85);
+border:1px solid #0f0;font-family:monospace;font-size:12px;
+padding:8px;z-index:9999;pointer-events:none;}
 #pos{bottom:20px;left:20px;}
-#sat{bottom:20px;right:20px;width:260px;}
+#leo{bottom:20px;right:20px;width:260px;}
 #rf{top:20px;right:20px;}
 </style>
 </head>
 <body>
-
 <div id="map"></div>
 <div id="pos" class="hud">
-<b>POSITION</b><br>
 LAT <span id="lat"></span><br>
 LON <span id="lon"></span><br>
 ERR <span id="err"></span> m<br>
 MODE <span id="mode"></span>
 </div>
-
-<div id="sat" class="hud"><b>ACTIVE LEO</b><div id="sats"></div></div>
-<div id="rf" class="hud"><b>RF SPECTRUM</b><div id="spec"></div></div>
+<div id="leo" class="hud"><b>ACTIVE LEO</b><div id="list"></div></div>
+<div id="rf" class="hud"><b>RF</b><div id="spec"></div></div>
 
 <script>
 var map=L.map('map').setView([12.970609,80.043139],13);
 L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png').addTo(map);
-L.circleMarker([12.970609,80.043139],{radius:6,color:'#00ff00'}).addTo(map);
+L.circleMarker([12.970609,80.043139],{radius:6,color:'#0f0'}).addTo(map);
+
+var satLayer=L.layerGroup().addTo(map);
+var linkLayer=L.layerGroup().addTo(map);
 
 function update(){
 fetch('/data').then(r=>r.json()).then(d=>{
-lat.innerText=d.fix.lat.toFixed(6);
-lon.innerText=d.fix.lon.toFixed(6);
-err.innerText=d.fix.err;
-mode.innerText=d.fix.mode;
+lat.textContent=d.fix.lat.toFixed(6);
+lon.textContent=d.fix.lon.toFixed(6);
+err.textContent=d.fix.err;
+mode.textContent=d.fix.mode;
 
-sats.innerHTML="";
+satLayer.clearLayers();
+linkLayer.clearLayers();
+list.innerHTML="";
+
 d.sats.forEach(s=>{
-sats.innerHTML+=`${s.name}<br>EL:${s.el} AZ:${s.az}<br>`;
+var m=L.circleMarker([s.lat,s.lon],{radius:4,color:'#0f0'});
+satLayer.addLayer(m);
+linkLayer.addLayer(L.polyline([[12.970609,80.043139],[s.lat,s.lon]],{color:'#0f0',weight:1}));
+list.innerHTML+=`${s.name}<br>`;
 });
 
 spec.innerHTML=d.spectrum.map(v=>"▮").join("");
 });
 }
-setInterval(update,1000);update();
+
+setInterval(update,1000);
+update();
 </script>
 </body>
 </html>
 """
 
-# ======================================================
-# ROUTES
-# ======================================================
+# ================= ROUTES =================
 @app.route("/")
 def index():
     return render_template_string(HTML)
@@ -219,9 +157,7 @@ def index():
 def data():
     return jsonify(state)
 
-# ======================================================
-# MAIN
-# ======================================================
+# ================= MAIN =================
 if __name__ == "__main__":
     NavEngine().start()
     app.run(host="0.0.0.0", port=5000)
